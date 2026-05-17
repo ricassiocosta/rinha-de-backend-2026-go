@@ -96,7 +96,7 @@ func envIntOrDefault(key string, def int) int {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
+	runtime.GOMAXPROCS(4)
 
 	sockPath = envOrDefault("SOCK_PATH", "/var/run/api/api.sock")
 	dataDir = envOrDefault("DATA_DIR", "/data")
@@ -127,6 +127,9 @@ func main() {
 		NoDefaultContentType:  true,
 		NoDefaultDate:         true,
 		ReduceMemoryUsage:     false,
+		Concurrency:           512,
+		ReadBufferSize:        4096,
+		WriteBufferSize:       4096,
 	}
 
 	fmt.Printf("[startup] Serving on %s (GOMAXPROCS=%d, GOGC=off)\n", sockPath, runtime.GOMAXPROCS(0))
@@ -526,10 +529,6 @@ func searchIVF(query *[DIMS]float32) int {
 	worstDist := maxDist
 	worstIdx := 0
 
-	// Early termination threshold: if all K=5 neighbors are within this distance,
-	// the classification is already confident. ~0.14 normalized = 0.14² × 14 × 65534² ≈ 1.18B
-	const earlyTermThreshold int64 = 1_180_000_000
-
 	// Pre-compute sentinel distances (integer)
 	sq5 := int64(sq[5])
 	sq6 := int64(sq[6])
@@ -537,10 +536,6 @@ func searchIVF(query *[DIMS]float32) int {
 	sentDist6 := (65534 + sq6) * (65534 + sq6)
 
 	for ci := 0; ci < nprobe; ci++ {
-		// Early termination: if worst of K=5 is already below threshold, stop
-		if ci >= 2 && worstDist < earlyTermThreshold {
-			break
-		}
 
 		c := topClusters[ci]
 		offset := int(clusterOffsets[c])
