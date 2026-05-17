@@ -1,0 +1,66 @@
+services:
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - api-sockets:/var/run/api
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "48MB"
+
+  api-1:
+    build: .
+    environment:
+      SOCK_PATH: /var/run/api/api1.sock
+      DATA_DIR: /data
+      NPROBE: "7"
+      NPROBE_MIN: "5"
+      NPROBE_MAX: "12"
+    volumes:
+      - api-sockets:/var/run/api
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /var/run/api/api1.sock"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "151MB"
+
+  api-2:
+    build: .
+    environment:
+      SOCK_PATH: /var/run/api/api2.sock
+      DATA_DIR: /data
+      NPROBE: "7"
+      NPROBE_MIN: "5"
+      NPROBE_MAX: "12"
+    volumes:
+      - api-sockets:/var/run/api
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /var/run/api/api2.sock"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.425"
+          memory: "151MB"
+
+volumes:
+  api-sockets:
