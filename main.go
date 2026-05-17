@@ -443,24 +443,25 @@ func searchIVF(query *[DIMS]float32) int {
 	centDists := sc.centDists[:numClusters]
 	topClusters := sc.topClusters[:nprobeMax]
 
-	// Scale query to Uint16 space
-	var scaledQuery [DIMS]float32
+	// Scale query to Uint16 integer space (avoid float in inner loop)
+	var sq [DIMS]int32
 	for d := 0; d < DIMS; d++ {
 		if query[d] < 0 {
-			scaledQuery[d] = 65535
+			sq[d] = 65535
 		} else {
-			scaledQuery[d] = query[d] * 65534
+			sq[d] = int32(query[d] * 65534)
 		}
 	}
 
 	hasSentinel := query[5] < 0
 
-	// Distance from query to every centroid (float space)
+	// Distance from query to every centroid (float32 space — centroids are float32)
 	for c := 0; c < numClusters; c++ {
 		base := c * DIMS
+		cent := centroids[base : base+DIMS : base+DIMS] // BCE
 		var dist float32
 		for d := 0; d < DIMS; d++ {
-			diff := query[d] - centroids[base+d]
+			diff := query[d] - cent[d]
 			dist += diff * diff
 		}
 		centDists[c] = dist
@@ -483,15 +484,15 @@ func searchIVF(query *[DIMS]float32) int {
 	// Adaptive NPROBE via distance ratio
 	var nearDist, farDist float32
 	nearC := topClusters[0]
-	nearBase := nearC * DIMS
+	nearCent := centroids[nearC*DIMS : nearC*DIMS+DIMS : nearC*DIMS+DIMS]
 	for d := 0; d < DIMS; d++ {
-		diff := query[d] - centroids[nearBase+d]
+		diff := query[d] - nearCent[d]
 		nearDist += diff * diff
 	}
 	farC := topClusters[nprobeBase]
-	farBase := farC * DIMS
+	farCent := centroids[farC*DIMS : farC*DIMS+DIMS : farC*DIMS+DIMS]
 	for d := 0; d < DIMS; d++ {
-		diff := query[d] - centroids[farBase+d]
+		diff := query[d] - farCent[d]
 		farDist += diff * diff
 	}
 
@@ -515,46 +516,72 @@ func searchIVF(query *[DIMS]float32) int {
 		return 0
 	}
 
-	// Linear scan through probed clusters
-	var topDist [K]float64
+	// Linear scan using pure integer arithmetic (no float64 conversions)
+	var topDist [K]int64
 	var topLbl [K]uint8
+	const maxDist = int64(math.MaxInt64)
 	for j := 0; j < K; j++ {
-		topDist[j] = math.MaxFloat64
+		topDist[j] = maxDist
 	}
-	worstDist := math.MaxFloat64
+	worstDist := maxDist
 	worstIdx := 0
 
-	if hasSentinel {
-		for ci := 0; ci < nprobe; ci++ {
-			c := topClusters[ci]
-			offset := int(clusterOffsets[c])
-			size := int(clusterSizes[c])
-			vecBase := offset * DIMS
+	// Early termination threshold: if all K=5 neighbors are within this distance,
+	// the classification is already confident. ~0.14 normalized = 0.14² × 14 × 65534² ≈ 1.18B
+	const earlyTermThreshold int64 = 1_180_000_000
 
+	// Pre-compute sentinel distances (integer)
+	sq5 := int64(sq[5])
+	sq6 := int64(sq[6])
+	sentDist5 := (65534 + sq5) * (65534 + sq5)
+	sentDist6 := (65534 + sq6) * (65534 + sq6)
+
+	for ci := 0; ci < nprobe; ci++ {
+		// Early termination: if worst of K=5 is already below threshold, stop
+		if ci >= 2 && worstDist < earlyTermThreshold {
+			break
+		}
+
+		c := topClusters[ci]
+		offset := int(clusterOffsets[c])
+		size := int(clusterSizes[c])
+		vecBase := offset * DIMS
+
+		// Bounds check elimination: validate entire cluster is accessible
+		if vecBase+size*DIMS > len(vectors) {
+			continue
+		}
+		clusterVecs := vectors[vecBase : vecBase+size*DIMS]
+		clusterLabels := labels[offset : offset+size]
+
+		if hasSentinel {
 			for i := 0; i < size; i++ {
-				base := vecBase + i*DIMS
-				var dist float64
+				base := i * DIMS
+				vec := clusterVecs[base : base+DIMS : base+DIMS] // BCE hint
+
+				var dist int64
 				for d := 0; d < 5; d++ {
-					diff := float64(scaledQuery[d]) - float64(vectors[base+d])
+					diff := int64(sq[d]) - int64(vec[d])
 					dist += diff * diff
 				}
-				rv5 := vectors[base+5]
+				// Sentinel query dims 5,6: distance = (65534+refVal)² if ref is not sentinel
+				rv5 := vec[5]
 				if rv5 != 65535 {
-					cd5 := float64(65534 + int(rv5))
+					cd5 := int64(65534 + int64(rv5))
 					dist += cd5 * cd5
 				}
-				rv6 := vectors[base+6]
+				rv6 := vec[6]
 				if rv6 != 65535 {
-					cd6 := float64(65534 + int(rv6))
+					cd6 := int64(65534 + int64(rv6))
 					dist += cd6 * cd6
 				}
 				for d := 7; d < DIMS; d++ {
-					diff := float64(scaledQuery[d]) - float64(vectors[base+d])
+					diff := int64(sq[d]) - int64(vec[d])
 					dist += diff * diff
 				}
 				if dist < worstDist {
 					topDist[worstIdx] = dist
-					topLbl[worstIdx] = labels[offset+i]
+					topLbl[worstIdx] = clusterLabels[i]
 					worstDist = 0
 					for j := 0; j < K; j++ {
 						if topDist[j] > worstDist {
@@ -564,45 +591,36 @@ func searchIVF(query *[DIMS]float32) int {
 					}
 				}
 			}
-		}
-	} else {
-		sq5 := float64(scaledQuery[5])
-		sq6 := float64(scaledQuery[6])
-		sentDist5 := (65534 + sq5) * (65534 + sq5)
-		sentDist6 := (65534 + sq6) * (65534 + sq6)
-
-		for ci := 0; ci < nprobe; ci++ {
-			c := topClusters[ci]
-			offset := int(clusterOffsets[c])
-			size := int(clusterSizes[c])
-			vecBase := offset * DIMS
-
+		} else {
 			for i := 0; i < size; i++ {
-				base := vecBase + i*DIMS
-				var dist float64
+				base := i * DIMS
+				vec := clusterVecs[base : base+DIMS : base+DIMS] // BCE hint
+
+				var dist int64
 				for d := 0; d < 5; d++ {
-					diff := float64(scaledQuery[d]) - float64(vectors[base+d])
+					diff := int64(sq[d]) - int64(vec[d])
 					dist += diff * diff
 				}
-				if vectors[base+5] == 65535 {
+				// Non-sentinel query: if ref is sentinel, use precomputed large distance
+				if vec[5] == 65535 {
 					dist += sentDist5
 				} else {
-					diff := sq5 - float64(vectors[base+5])
+					diff := sq5 - int64(vec[5])
 					dist += diff * diff
 				}
-				if vectors[base+6] == 65535 {
+				if vec[6] == 65535 {
 					dist += sentDist6
 				} else {
-					diff := sq6 - float64(vectors[base+6])
+					diff := sq6 - int64(vec[6])
 					dist += diff * diff
 				}
 				for d := 7; d < DIMS; d++ {
-					diff := float64(scaledQuery[d]) - float64(vectors[base+d])
+					diff := int64(sq[d]) - int64(vec[d])
 					dist += diff * diff
 				}
 				if dist < worstDist {
 					topDist[worstIdx] = dist
-					topLbl[worstIdx] = labels[offset+i]
+					topLbl[worstIdx] = clusterLabels[i]
 					worstDist = 0
 					for j := 0; j < K; j++ {
 						if topDist[j] > worstDist {
@@ -619,7 +637,7 @@ func searchIVF(query *[DIMS]float32) int {
 
 	fraudCount := 0
 	for j := 0; j < K; j++ {
-		if topDist[j] < math.MaxFloat64 && topLbl[j] == 1 {
+		if topDist[j] < maxDist && topLbl[j] == 1 {
 			fraudCount++
 		}
 	}
