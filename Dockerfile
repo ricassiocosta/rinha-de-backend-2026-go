@@ -18,7 +18,9 @@ RUN DATA_DIR=/data \
 FROM golang:1.24-alpine AS builder
 
 WORKDIR /build
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY *.go ./
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
@@ -35,5 +37,7 @@ ENV SOCK_PATH=/var/run/api/api.sock
 ENV NPROBE=7
 ENV NPROBE_MIN=5
 ENV NPROBE_MAX=12
+ENV GOGC=off
+ENV GOMAXPROCS=1
 
 ENTRYPOINT ["/app/server"]
